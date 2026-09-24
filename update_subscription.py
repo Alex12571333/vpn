@@ -1,157 +1,245 @@
 #!/usr/bin/env python3
-"""Collect public VPN URI subscriptions and build Happ/Incy import files."""
+"""Build small, latency-ranked Happ/Incy pools from public VPN feeds."""
 
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import datetime as dt
+import html
 import json
+import math
 import os
 import re
+import socket
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "docs"
-TIMEOUT = 30
-MAX_BYTES = 20 * 1024 * 1024
-URI_RE = re.compile(r"(?im)(?:^|[\s\"'])((?:vless|vmess|trojan|ss|ssr|tuic|hysteria2|hy2|wireguard)://[^\s\"'<>]+)")
-SUPPORTED = {"vless", "vmess", "trojan", "ss", "ssr", "tuic", "hysteria2", "hy2", "wireguard"}
+TIMEOUT = 20
+TCP_TIMEOUT = 2.0
+MAX_BYTES = 25 * 1024 * 1024
+MAX_CANDIDATES_PER_POOL = 1500
+NORMAL_LIMIT = 5
+WHITELIST_LIMIT = 10
+SCHEMES = {"vless", "vmess", "trojan", "ss", "ssr", "tuic", "hysteria2", "hy2"}
+URI_RE = re.compile(r"(?im)(?:^|[\s\"'])((?:vless|vmess|trojan|ss|ssr|tuic|hysteria2|hy2)://[^\s\"'<>]+)")
 
-# Keep sources to public text subscription endpoints; never clone or execute repositories.
 SOURCES = {
-    "all_subs": [
-        "https://raw.githubusercontent.com/solovyov-jenya2004/all_subs/main/final_sorted",
-    ],
-    "igareck": [
-        "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS.txt",
-        "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-checked.txt",
-    ],
-    "vless-checker": [
-        "https://raw.githubusercontent.com/tiagorrg/vless-checker/main/docs/keys.json",
-    ],
+    "normal": {
+        "igareck_black": "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS.txt",
+        "vless_checker": "https://raw.githubusercontent.com/tiagorrg/vless-checker/main/docs/keys.json",
+    },
+    "whitelist": {
+        "all_subs": "https://raw.githubusercontent.com/solovyov-jenya2004/all_subs/main/final_sorted",
+        "igareck_white_cidr": "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-checked.txt",
+        "vless_checker": "https://raw.githubusercontent.com/tiagorrg/vless-checker/main/docs/keys.json",
+    },
 }
 
 
-def fetch(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "personal-vpn-subscription-aggregator/1.0"})
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
-        data = response.read(MAX_BYTES + 1)
-    if len(data) > MAX_BYTES:
-        raise ValueError("response exceeds 20 MiB limit")
-    return data
+@dataclass
+class Candidate:
+    uri: str
+    source: str
+    source_latency_ms: float | None = None
 
-
-def find_uris(payload: bytes) -> list[str]:
-    text = payload.decode("utf-8-sig", errors="replace")
-    # JSON may contain escaped URL separators; parse strings recursively first.
-    try:
-        obj = json.loads(text)
-        strings: list[str] = []
-
-        def walk(value: object) -> None:
-            if isinstance(value, str):
-                strings.append(value)
-            elif isinstance(value, dict):
-                for item in value.values():
-                    walk(item)
-            elif isinstance(value, list):
-                for item in value:
-                    walk(item)
-
-        walk(obj)
-        text = "\n".join(strings)
-    except (json.JSONDecodeError, RecursionError):
-        pass
-
-    result = []
-    for match in URI_RE.findall(text):
-        uri = match.rstrip(",;)]}")
+    @property
+    def endpoint(self) -> tuple[str, int] | None:
         try:
-            if urlsplit(uri).scheme.lower() in SUPPORTED:
-                result.append(uri)
+            parsed = urlsplit(self.uri)
+            if parsed.scheme.lower() not in SCHEMES or not parsed.hostname or not parsed.port:
+                return None
+            return parsed.hostname.lower(), parsed.port
+        except ValueError:
+            return None
+
+
+def fetch(url: str) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": "vpn-subscription-pool/1.0"})
+    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        payload = response.read(MAX_BYTES + 1)
+    if len(payload) > MAX_BYTES:
+        raise ValueError("response exceeds 25 MiB limit")
+    return payload
+
+
+def extract_uris(payload: bytes) -> list[str]:
+    text = payload.decode("utf-8-sig", errors="replace")
+    found: list[str] = []
+    for match in URI_RE.findall(text):
+        try:
+            if urlsplit(match).scheme.lower() in SCHEMES:
+                found.append(match.rstrip(",;)]}"))
         except ValueError:
             continue
-    return result
+    return found
 
 
-def sort_key(uri: str) -> tuple[str, str, str, str]:
-    parsed = urlsplit(uri)
-    scheme = parsed.scheme.lower()
-    host = (parsed.hostname or "").lower()
-    label = unquote(parsed.fragment).lower()
-    # Keep each protocol together, then sort by displayed location/name and endpoint.
-    return scheme, label, host, uri
+def checker_candidates(data: object, pool: str) -> list[Candidate]:
+    if not isinstance(data, dict):
+        return []
+    found: list[Candidate] = []
+    for group, contents in data.items():
+        is_whitelist = isinstance(group, str) and group.startswith("w_")
+        # The checker's "russia" group also comes from its whitelist feed.
+        if group == "russia":
+            continue
+        if is_whitelist != (pool == "whitelist"):
+            continue
+        # The checker's "other_countries" result is a map of country -> ranked results.
+        sections = contents.values() if group == "other_countries" and isinstance(contents, dict) else [contents]
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            entries = section.get("top10", [])
+            if not isinstance(entries, list):
+                continue
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                uri = item.get("key")
+                latency = item.get("latency_ms")
+                if not isinstance(uri, str):
+                    continue
+                try:
+                    latency_value = float(latency)
+                    if not math.isfinite(latency_value) or latency_value < 0:
+                        latency_value = None
+                except (TypeError, ValueError):
+                    latency_value = None
+                if urlsplit(uri).scheme.lower() in SCHEMES:
+                    found.append(Candidate(uri.strip(), "vless-checker", latency_value))
+    return found
+
+
+def unique_endpoints(candidates: list[Candidate]) -> list[Candidate]:
+    # Prefer a source's already measured configuration where several variants share a server.
+    candidates.sort(key=lambda c: (c.source_latency_ms is None,
+                                   c.source_latency_ms if c.source_latency_ms is not None else math.inf,
+                                   c.uri))
+    unique: dict[tuple[str, int], Candidate] = {}
+    for candidate in candidates:
+        endpoint = candidate.endpoint
+        if endpoint is not None:
+            unique.setdefault(endpoint, candidate)
+    return list(unique.values())[:MAX_CANDIDATES_PER_POOL]
+
+
+def tcp_probe(candidate: Candidate) -> tuple[Candidate, float | None]:
+    endpoint = candidate.endpoint
+    if endpoint is None:
+        return candidate, None
+    started = time.perf_counter()
+    try:
+        with socket.create_connection(endpoint, timeout=TCP_TIMEOUT):
+            return candidate, round((time.perf_counter() - started) * 1000, 1)
+    except OSError:
+        return candidate, None
+
+
+def rank_live(candidates: list[Candidate]) -> list[tuple[Candidate, float]]:
+    reachable: list[tuple[Candidate, float]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
+        futures = [pool.submit(tcp_probe, candidate) for candidate in candidates]
+        for future in concurrent.futures.as_completed(futures):
+            candidate, latency = future.result()
+            if latency is not None:
+                reachable.append((candidate, latency))
+    return sorted(reachable, key=lambda item: (item[1], item[0].uri))
 
 
 def atomic_write(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    fd, temp_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as stream:
             stream.write(content)
-        os.replace(tmp_name, path)
+        os.replace(temp_path, path)
     finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def write_pool(name: str, ranked: list[tuple[Candidate, float]], limit: int) -> list[str]:
+    selected = ranked[:limit]
+    uris = [candidate.uri for candidate, _ in selected]
+    content = ("\n".join(uris) + ("\n" if uris else "")).encode("utf-8")
+    atomic_write(OUT / f"{name}.txt", content)
+    atomic_write(OUT / f"{name}.base64", base64.b64encode(content) + b"\n")
+    return uris
 
 
 def main() -> int:
-    collected: list[str] = []
+    candidates: dict[str, list[Candidate]] = {"normal": [], "whitelist": []}
     failures: list[str] = []
-    for source, urls in SOURCES.items():
-        source_count = 0
-        for url in urls:
+    fetched: dict[str, bytes] = {}
+
+    for pool, sources in SOURCES.items():
+        for source, url in sources.items():
             try:
-                found = find_uris(fetch(url))
-                source_count += len(found)
-                collected.extend(found)
-            except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
-                failures.append(f"{source}: {url} ({exc})")
-        print(f"{source}: найдено {source_count} конфигураций", file=sys.stderr)
+                fetched[source] = fetched.get(source) or fetch(url)
+                payload = fetched[source]
+                if source == "vless_checker":
+                    candidates[pool].extend(checker_candidates(json.loads(payload), pool))
+                else:
+                    candidates[pool].extend(Candidate(uri, source) for uri in extract_uris(payload))
+            except (urllib.error.URLError, TimeoutError, ValueError, OSError, json.JSONDecodeError) as exc:
+                failures.append(f"{pool}/{source}: {exc}")
 
-    # Exact URI de-duplication preserves per-source server names while preventing repeats.
-    unique = list(dict.fromkeys(uri.strip() for uri in collected if uri.strip()))
-    if not unique:
-        print("Не получено ни одной конфигурации; существующие файлы не изменены.", file=sys.stderr)
-        for failure in failures:
-            print(f"  {failure}", file=sys.stderr)
-        return 1
+    normal_candidates = unique_endpoints(candidates["normal"])
+    whitelist_candidates = unique_endpoints(candidates["whitelist"])
+    print(f"Кандидаты: обычные {len(normal_candidates)}, белые списки {len(whitelist_candidates)}", file=sys.stderr)
 
-    unique.sort(key=sort_key)
-    plain = ("\n".join(unique) + "\n").encode("utf-8")
-    encoded = base64.b64encode(plain) + b"\n"
-    atomic_write(OUT / "subscription.txt", plain)
-    atomic_write(OUT / "subscription.base64", encoded)
-    metadata = {
-        "servers": len(unique),
-        "updated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "sources": list(SOURCES),
-        "failed_sources": failures,
+    normal_ranked = rank_live(normal_candidates)
+    whitelist_ranked = rank_live(whitelist_candidates)
+    normal = write_pool("normal", normal_ranked, NORMAL_LIMIT)
+    whitelist = write_pool("whitelist", whitelist_ranked, WHITELIST_LIMIT)
+    combined = normal + whitelist
+    combined_bytes = ("\n".join(combined) + ("\n" if combined else "")).encode("utf-8")
+    atomic_write(OUT / "subscription.txt", combined_bytes)
+    atomic_write(OUT / "subscription.base64", base64.b64encode(combined_bytes) + b"\n")
+
+    timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
+    status = {
+        "updated_at_utc": timestamp,
+        "normal": {"selected": len(normal), "target": NORMAL_LIMIT, "candidates": len(normal_candidates), "tcp_reachable": len(normal_ranked)},
+        "whitelist": {"selected": len(whitelist), "target": WHITELIST_LIMIT, "candidates": len(whitelist_candidates), "tcp_reachable": len(whitelist_ranked)},
+        "source_failures": failures,
+        "probe": "TCP connect latency measured from GitHub Actions runner; not a full VPN handshake or a guarantee from the user's network.",
     }
-    atomic_write(OUT / "status.json", (json.dumps(metadata, ensure_ascii=False, indent=2) + "\n").encode())
+    atomic_write(OUT / "status.json", (json.dumps(status, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+
+    normal_latency = normal_ranked[0][1] if normal_ranked else "—"
+    whitelist_latency = whitelist_ranked[0][1] if whitelist_ranked else "—"
     page = f'''<!doctype html>
 <html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Моя VPN-подписка</title>
+<title>VPN-подписки · Alex</title>
 <style>
 *{{box-sizing:border-box}}body{{margin:0;background:#0b1020;color:#e7ecf7;font:16px/1.55 system-ui,sans-serif;display:grid;min-height:100vh;place-items:center;padding:24px}}
-main{{width:min(680px,100%);padding:36px;border:1px solid #26314c;border-radius:24px;background:linear-gradient(145deg,#151f36,#101729);box-shadow:0 24px 80px #0006}}
-h1{{margin:0 0 8px;font-size:clamp(28px,6vw,42px)}}p{{color:#aab6d0}}.count{{font-size:14px;color:#6ee7b7}}
-a{{display:block;margin-top:14px;padding:16px 18px;border-radius:14px;background:#202d49;color:#fff;text-decoration:none;font-weight:650}}a:hover{{background:#2b3c60}}
-small{{display:block;margin-top:24px;color:#8290ae}}
-</style><main><h1>VPN-подписка</h1><p>Собранный список конфигураций для импорта в Happ и Incy.</p>
-<div class="count">{len(unique)} серверов · обновлено {metadata['updated_at_utc']}</div>
-<a href="subscription.txt">Открыть подписку · обычный формат</a>
-<a href="subscription.base64">Открыть подписку · Base64</a>
-<small>Список автоматически обновляется каждый час. Доступность узлов может меняться.</small></main></html>
+main{{width:min(720px,100%);padding:36px;border:1px solid #26314c;border-radius:24px;background:linear-gradient(145deg,#151f36,#101729);box-shadow:0 24px 80px #0006}}
+h1{{margin:0 0 8px;font-size:clamp(28px,6vw,42px)}}p{{color:#aab6d0}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin-top:24px}}
+section{{padding:20px;border:1px solid #2b3958;border-radius:16px;background:#111a2c}}h2{{margin:0 0 4px;font-size:19px}}.meta{{font-size:13px;color:#6ee7b7}}
+a{{display:block;margin-top:12px;padding:13px 15px;border-radius:12px;background:#202d49;color:#fff;text-decoration:none;font-weight:650}}a:hover{{background:#2b3c60}}small{{display:block;margin-top:24px;color:#8290ae}}
+</style><main><h1>VPN-подписки</h1><p>Пулы для Happ и Incy. Сборка каждый час; сначала идут узлы с меньшей TCP-задержкой.</p>
+<div class="grid"><section><h2>Обычные серверы</h2><div class="meta">{len(normal)} из {NORMAL_LIMIT} · лучший TCP-отклик {html.escape(str(normal_latency))} мс</div>
+<a href="normal.txt">Обычная подписка</a><a href="normal.base64">Обычная подписка · Base64</a></section>
+<section><h2>Обход белых списков</h2><div class="meta">{len(whitelist)} из {WHITELIST_LIMIT} · лучший TCP-отклик {html.escape(str(whitelist_latency))} мс</div>
+<a href="whitelist.txt">Подписка для белых списков</a><a href="whitelist.base64">Белые списки · Base64</a></section></div>
+<small>Проверяется открытие TCP-порта с сервера GitHub Actions. Это не проверка VPN-авторизации; реальная доступность и скорость зависят от вашей сети. Обновлено {html.escape(timestamp)}.</small></main></html>
 '''
     atomic_write(OUT / "index.html", page.encode("utf-8"))
-    print(f"Готово: {len(unique)} уникальных конфигураций → {OUT}", file=sys.stderr)
+    print(f"Отобрано: обычных {len(normal)}/{NORMAL_LIMIT}, белые списки {len(whitelist)}/{WHITELIST_LIMIT}", file=sys.stderr)
+    if not normal and not whitelist:
+        print("Рабочих TCP-узлов не найдено; Pages не обновлять.", file=sys.stderr)
+        return 1
     return 0
 
 
