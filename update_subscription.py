@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "docs"
@@ -29,6 +29,7 @@ MAX_BYTES = 25 * 1024 * 1024
 MAX_CANDIDATES_PER_POOL = 1500
 NORMAL_LIMIT = 5
 WHITELIST_LIMIT = 10
+PROFILE_TITLE = "velesVPN free"
 SCHEMES = {"vless", "vmess", "trojan", "ss", "ssr", "tuic", "hysteria2", "hy2"}
 URI_RE = re.compile(r"(?im)(?:^|[\s\"'])((?:vless|vmess|trojan|ss|ssr|tuic|hysteria2|hy2)://[^\s\"'<>]+)")
 
@@ -50,6 +51,7 @@ class Candidate:
     uri: str
     source: str
     source_latency_ms: float | None = None
+    location_hint: str | None = None
 
     @property
     def endpoint(self) -> tuple[str, int] | None:
@@ -95,8 +97,8 @@ def checker_candidates(data: object, pool: str) -> list[Candidate]:
         if is_whitelist != (pool == "whitelist"):
             continue
         # The checker's "other_countries" result is a map of country -> ranked results.
-        sections = contents.values() if group == "other_countries" and isinstance(contents, dict) else [contents]
-        for section in sections:
+        sections = contents.items() if group == "other_countries" and isinstance(contents, dict) else [(group, contents)]
+        for section_name, section in sections:
             if not isinstance(section, dict):
                 continue
             entries = section.get("top10", [])
@@ -116,8 +118,78 @@ def checker_candidates(data: object, pool: str) -> list[Candidate]:
                 except (TypeError, ValueError):
                     latency_value = None
                 if urlsplit(uri).scheme.lower() in SCHEMES:
-                    found.append(Candidate(uri.strip(), "vless-checker", latency_value))
+                    hint = section_name.removeprefix("w_") if isinstance(section_name, str) else None
+                    found.append(Candidate(uri.strip(), "vless-checker", latency_value, hint))
     return found
+
+
+COUNTRIES = [
+    (("germany", "deutschland", "германия"), "🇩🇪 Германия"),
+    (("czechia", "czech republic", "чехия"), "🇨🇿 Чехия"),
+    (("finland", "финляндия"), "🇫🇮 Финляндия"),
+    (("poland", "польша"), "🇵🇱 Польша"),
+    (("netherlands", "нужерланды", "holland", "нидерланды"), "🇳🇱 Нидерланды"),
+    (("sweden", "швеция"), "🇸🇪 Швеция"),
+    (("estonia", "эстония"), "🇪🇪 Эстония"),
+    (("latvia", "латвия"), "🇱🇻 Латвия"),
+    (("lithuania", "литва"), "🇱🇹 Литва"),
+    (("france", "франция"), "🇫🇷 Франция"),
+    (("united states", "usa", "сша"), "🇺🇸 США"),
+    (("united kingdom", "uk", "британия", "англия"), "🇬🇧 Великобритания"),
+    (("singapore", "сингапур"), "🇸🇬 Сингапур"),
+    (("japan", "япония"), "🇯🇵 Япония"),
+    (("turkey", "türkiye", "турция"), "🇹🇷 Турция"),
+    (("austria", "австрия"), "🇦🇹 Австрия"),
+    (("switzerland", "швейцария"), "🇨🇭 Швейцария"),
+    (("canada", "канада"), "🇨🇦 Канада"),
+    (("norway", "норвегия"), "🇳🇴 Норвегия"),
+    (("belgium", "бельгия"), "🇧🇪 Бельгия"),
+    (("italy", "италия"), "🇮🇹 Италия"),
+    (("spain", "испания"), "🇪🇸 Испания"),
+    (("russia", "россия"), "🇷🇺 Россия"),
+]
+CITY_NAMES = {
+    "frankfurt": "Франкфурт", "frankfurt am main": "Франкфурт",
+    "prague": "Прага", "warsaw": "Варшава", "helsinki": "Хельсинки",
+    "amsterdam": "Амстердам", "stockholm": "Стокгольм", "paris": "Париж",
+    "london": "Лондон", "zurich": "Цюрих", "vienna": "Вена",
+    "tallinn": "Таллин", "riga": "Рига", "vilnius": "Вильнюс",
+    "singapore": "Сингапур", "tokyo": "Токио", "istanbul": "Стамбул",
+}
+
+
+def node_label(candidate: Candidate, pool: str) -> str:
+    fragment = unquote(urlsplit(candidate.uri).fragment)
+    hint = (candidate.location_hint or "").replace("_", " ")
+    text = f"{hint} {fragment}".lower()
+    location = None
+    for aliases, label in COUNTRIES:
+        if any(re.search(rf"(?<![a-zа-я]){re.escape(alias)}(?![a-zа-я])", text) for alias in aliases):
+            location = label
+            break
+    if location is None:
+        flag = re.search(r"[\U0001F1E6-\U0001F1FF]{2}", fragment)
+        location = f"{flag.group()} Локация не указана" if flag else "🌐 Локация не указана"
+    city = next((ru for en, ru in CITY_NAMES.items() if en in text), None)
+    if city and city.lower() not in location.lower():
+        location += f", {city}"
+
+    if pool == "normal":
+        suffix = "ОБЫЧНЫЙ"
+    else:
+        cidr = candidate.source in {"igareck_white_cidr", "vless-checker"} or "cidr" in fragment.lower()
+        sni = "sni" in fragment.lower()
+        kind = "CIDR" if cidr else "SNI" if sni else "БС"
+        service_match = re.search(r"\b(vk|yandex|яндекс|youtube|ютуб|telegram|телеграм|discord|дискорд|google|гугл|cdnvideo|beeline|мтс|мегафон)\b", fragment, re.I)
+        service = service_match.group(0).upper() if service_match else None
+        suffix = f"БС · {kind}" + (f" · {service}" if service else "")
+    return f"{location} · {suffix}"
+
+
+def labeled_uri(candidate: Candidate, pool: str) -> str:
+    parsed = urlsplit(candidate.uri)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query,
+                       quote(node_label(candidate, pool), safe="")))
 
 
 def unique_endpoints(candidates: list[Candidate]) -> list[Candidate]:
@@ -170,7 +242,7 @@ def atomic_write(path: Path, content: bytes) -> None:
 
 def write_pool(name: str, ranked: list[tuple[Candidate, float]], limit: int) -> list[str]:
     selected = ranked[:limit]
-    uris = [candidate.uri for candidate, _ in selected]
+    uris = [labeled_uri(candidate, name) for candidate, _ in selected]
     content = ("\n".join(uris) + ("\n" if uris else "")).encode("utf-8")
     atomic_write(OUT / f"{name}.txt", content)
     atomic_write(OUT / f"{name}.base64", base64.b64encode(content) + b"\n")
@@ -203,7 +275,8 @@ def main() -> int:
     normal = write_pool("normal", normal_ranked, NORMAL_LIMIT)
     whitelist = write_pool("whitelist", whitelist_ranked, WHITELIST_LIMIT)
     combined = normal + whitelist
-    combined_bytes = ("\n".join(combined) + ("\n" if combined else "")).encode("utf-8")
+    combined_body = [f"#profile-title: {PROFILE_TITLE}", *combined]
+    combined_bytes = ("\n".join(combined_body) + "\n").encode("utf-8")
     atomic_write(OUT / "subscription.txt", combined_bytes)
     atomic_write(OUT / "subscription.base64", base64.b64encode(combined_bytes) + b"\n")
 
@@ -221,14 +294,14 @@ def main() -> int:
     whitelist_latency = whitelist_ranked[0][1] if whitelist_ranked else "—"
     page = f'''<!doctype html>
 <html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VPN-подписки · Alex</title>
+<title>{PROFILE_TITLE}</title>
 <style>
 *{{box-sizing:border-box}}body{{margin:0;background:#0b1020;color:#e7ecf7;font:16px/1.55 system-ui,sans-serif;display:grid;min-height:100vh;place-items:center;padding:24px}}
 main{{width:min(720px,100%);padding:36px;border:1px solid #26314c;border-radius:24px;background:linear-gradient(145deg,#151f36,#101729);box-shadow:0 24px 80px #0006}}
 h1{{margin:0 0 8px;font-size:clamp(28px,6vw,42px)}}p{{color:#aab6d0}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin-top:24px}}
 section{{padding:20px;border:1px solid #2b3958;border-radius:16px;background:#111a2c}}h2{{margin:0 0 4px;font-size:19px}}.meta{{font-size:13px;color:#6ee7b7}}
 a{{display:block;margin-top:12px;padding:13px 15px;border-radius:12px;background:#202d49;color:#fff;text-decoration:none;font-weight:650}}a:hover{{background:#2b3c60}}small{{display:block;margin-top:24px;color:#8290ae}}
-</style><main><h1>VPN-подписки</h1><p>Пулы для Happ и Incy. Сборка каждый час; сначала идут узлы с меньшей TCP-задержкой.</p>
+</style><main><h1>{PROFILE_TITLE}</h1><p>Пулы для Happ и Incy. Сборка каждый час; сначала идут узлы с меньшей TCP-задержкой.</p>
 <div class="grid"><section><h2>Обычные серверы</h2><div class="meta">{len(normal)} из {NORMAL_LIMIT} · лучший TCP-отклик {html.escape(str(normal_latency))} мс</div>
 <a href="normal.txt">Обычная подписка</a><a href="normal.base64">Обычная подписка · Base64</a></section>
 <section><h2>Обход белых списков</h2><div class="meta">{len(whitelist)} из {WHITELIST_LIMIT} · лучший TCP-отклик {html.escape(str(whitelist_latency))} мс</div>
