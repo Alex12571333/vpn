@@ -365,7 +365,10 @@ def select_diverse_pools(
                 geo_attempts += 1
                 geolocate(candidate)
                 country = country_key(candidate)
-            country = country or "unknown-location"
+            # Do not publish a node with unknown country: it could exceed the
+            # per-country cap when its location cannot be verified.
+            if country is None:
+                continue
             if country_counts.get(country, 0) >= allowed_per_country:
                 continue
             selected[pool_name].append((candidate, latency))
@@ -376,7 +379,7 @@ def select_diverse_pools(
 
     print(
         f"Геолокация: {geo_attempts} запросов; выбрано разных стран "
-        f"{len(country_counts) - int('unknown-location' in country_counts)}",
+        f"{len(country_counts)}",
         file=sys.stderr,
     )
     print(
