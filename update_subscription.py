@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import base64
 import concurrent.futures
 import datetime as dt
 import html
@@ -52,6 +51,7 @@ class Candidate:
     source: str
     source_latency_ms: float | None = None
     location_hint: str | None = None
+    geo_location: str | None = None
 
     @property
     def endpoint(self) -> tuple[str, int] | None:
@@ -170,20 +170,70 @@ CITY_NAMES = {
     "tallinn": "Таллин", "riga": "Рига", "vilnius": "Вильнюс",
     "singapore": "Сингапур", "tokyo": "Токио", "istanbul": "Стамбул",
 }
+COUNTRY_RU = {
+    "DE": "Германия", "CZ": "Чехия", "FI": "Финляндия", "PL": "Польша",
+    "NL": "Нидерланды", "SE": "Швеция", "EE": "Эстония", "LV": "Латвия",
+    "LT": "Литва", "FR": "Франция", "US": "США", "GB": "Великобритания",
+    "SG": "Сингапур", "JP": "Япония", "TR": "Турция", "AT": "Австрия",
+    "CH": "Швейцария", "CA": "Канада", "NO": "Норвегия", "BE": "Бельгия",
+    "IT": "Италия", "ES": "Испания", "UA": "Украина", "IL": "Израиль",
+    "CN": "Китай", "HK": "Гонконг", "AE": "ОАЭ", "IE": "Ирландия",
+    "GR": "Греция", "PT": "Португалия", "RO": "Румыния", "BG": "Болгария",
+    "RS": "Сербия", "LU": "Люксембург", "IS": "Исландия", "GE": "Грузия",
+    "RU": "Россия", "KR": "Южная Корея", "VN": "Вьетнам", "ID": "Индонезия",
+    "MY": "Малайзия", "TH": "Таиланд", "IN": "Индия", "BR": "Бразилия",
+    "MX": "Мексика", "AR": "Аргентина", "DK": "Дания", "CY": "Кипр",
+    "SK": "Словакия", "SI": "Словения", "HR": "Хорватия", "MD": "Молдова",
+    "KZ": "Казахстан", "UZ": "Узбекистан", "AZ": "Азербайджан",
+    "AM": "Армения", "EG": "Египет", "ZA": "ЮАР", "NZ": "Новая Зеландия",
+    "AU": "Австралия", "TW": "Тайвань", "PK": "Пакистан", "BD": "Бангладеш",
+}
+
+
+def has_country(candidate: Candidate) -> bool:
+    text = f"{candidate.location_hint or ''} {unquote(urlsplit(candidate.uri).fragment)}".lower()
+    return any(re.search(rf"(?<![a-zа-я]){re.escape(alias)}(?![a-zа-я])", text)
+               for aliases, _ in COUNTRIES for alias in aliases)
+
+
+def geolocate(candidate: Candidate) -> None:
+    """Fill a missing label from the public server IP; keep failures non-fatal."""
+    endpoint = candidate.endpoint
+    if endpoint is None:
+        return
+    host = endpoint[0]
+    try:
+        ip = host if re.fullmatch(r"[0-9a-fA-F:.]+", host) else socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)[0][4][0]
+        url = f"https://ipwho.is/{quote(ip, safe=':.')}?fields=success,country,country_code"
+        request = urllib.request.Request(url, headers={"User-Agent": "velesVPN-free-subscription/1.0"})
+        with urllib.request.urlopen(request, timeout=4) as response:
+            data = json.loads(response.read(64 * 1024))
+        if not data.get("success"):
+            return
+        code = str(data.get("country_code", "")).upper()
+        country = COUNTRY_RU.get(code) or str(data.get("country", "")).strip()
+        flag = "".join(chr(ord(char) + 127397) for char in code) if re.fullmatch(r"[A-Z]{2}", code) else "🌐"
+        if country:
+            candidate.geo_location = f"{flag} {country}"
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, IndexError, json.JSONDecodeError):
+        return
 
 
 def node_label(candidate: Candidate, pool: str) -> str:
     fragment = unquote(urlsplit(candidate.uri).fragment)
     hint = (candidate.location_hint or "").replace("_", " ")
     text = f"{hint} {fragment}".lower()
-    location = None
+    location = candidate.geo_location
     for aliases, label in COUNTRIES:
         if any(re.search(rf"(?<![a-zа-я]){re.escape(alias)}(?![a-zа-я])", text) for alias in aliases):
             location = label
             break
     if location is None:
         flag = re.search(r"[\U0001F1E6-\U0001F1FF]{2}", fragment)
-        location = f"{flag.group()} Локация не указана" if flag else "🌐 Локация не указана"
+        flag_text = flag.group() if flag else ""
+        flag_country = next((name for code, name in COUNTRY_RU.items()
+                             if "".join(chr(ord(char) + 127397) for char in code) == flag_text), None)
+        location = f"{flag_text} {flag_country or 'Сервер'}" if flag_text else "🌐 Сервер"
     city = next((ru for en, ru in CITY_NAMES.items() if en in text), None)
     if city and city.lower() not in location.lower():
         location += f", {city}"
@@ -256,10 +306,11 @@ def atomic_write(path: Path, content: bytes) -> None:
 
 def write_pool(name: str, ranked: list[tuple[Candidate, float]], limit: int) -> list[str]:
     selected = ranked[:limit]
+    unknown = [candidate for candidate, _ in selected
+               if not has_country(candidate)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+        list(pool.map(geolocate, unknown))
     uris = [labeled_uri(candidate, name) for candidate, _ in selected]
-    content = ("\n".join(uris) + ("\n" if uris else "")).encode("utf-8")
-    atomic_write(OUT / f"{name}.txt", content)
-    atomic_write(OUT / f"{name}.base64", base64.b64encode(content) + b"\n")
     return uris
 
 
@@ -292,7 +343,6 @@ def main() -> int:
     combined_body = [f"#profile-title: {PROFILE_TITLE}", *combined]
     combined_bytes = ("\n".join(combined_body) + "\n").encode("utf-8")
     atomic_write(OUT / "subscription.txt", combined_bytes)
-    atomic_write(OUT / "subscription.base64", base64.b64encode(combined_bytes) + b"\n")
 
     timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
     status = {
@@ -316,10 +366,8 @@ h1{{margin:0 0 8px;font-size:clamp(28px,6vw,42px)}}p{{color:#aab6d0}}.grid{{disp
 section{{padding:20px;border:1px solid #2b3958;border-radius:16px;background:#111a2c}}h2{{margin:0 0 4px;font-size:19px}}.meta{{font-size:13px;color:#6ee7b7}}
 a{{display:block;margin-top:12px;padding:13px 15px;border-radius:12px;background:#202d49;color:#fff;text-decoration:none;font-weight:650}}a:hover{{background:#2b3c60}}small{{display:block;margin-top:24px;color:#8290ae}}
 </style><main><h1>{PROFILE_TITLE}</h1><p>Пулы для Happ и Incy. Сборка каждый час; сначала идут узлы с меньшей TCP-задержкой.</p>
-<div class="grid"><section><h2>Обычные серверы</h2><div class="meta">{len(normal)} из {NORMAL_LIMIT} · лучший TCP-отклик {html.escape(str(normal_latency))} мс</div>
-<a href="normal.txt">Обычная подписка</a><a href="normal.base64">Обычная подписка · Base64</a></section>
-<section><h2>Обход белых списков</h2><div class="meta">{len(whitelist)} из {WHITELIST_LIMIT} · лучший TCP-отклик {html.escape(str(whitelist_latency))} мс</div>
-<a href="whitelist.txt">Подписка для белых списков</a><a href="whitelist.base64">Белые списки · Base64</a></section></div>
+<div class="grid"><section><h2>Общий пул: {len(normal)} обычных + {len(whitelist)} для БС</h2><div class="meta">Обновляется каждый час · всего {len(combined)} серверов</div>
+<a href="subscription.txt">Добавить единую подписку в Happ</a></section></div>
 <small>Проверяется открытие TCP-порта с сервера GitHub Actions. Это не проверка VPN-авторизации; реальная доступность и скорость зависят от вашей сети. Обновлено {html.escape(timestamp)}.</small></main></html>
 '''
     atomic_write(OUT / "index.html", page.encode("utf-8"))
