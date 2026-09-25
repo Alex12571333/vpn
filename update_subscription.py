@@ -27,8 +27,10 @@ TIMEOUT = 20
 TCP_TIMEOUT = 2.0
 MAX_BYTES = 25 * 1024 * 1024
 MAX_CANDIDATES_PER_POOL = 1500
+MAX_GEOLOOKUPS_PER_RUN = 30
 NORMAL_LIMIT = 5
 WHITELIST_LIMIT = 10
+MAX_SERVERS_PER_COUNTRY = 2
 PROFILE_TITLE = "velesVPN free"
 SCHEMES = {"vless", "vmess", "trojan", "ss", "ssr", "tuic", "hysteria2", "hy2"}
 URI_RE = re.compile(r"(?im)(?:^|[\s\"'])((?:vless|vmess|trojan|ss|ssr|tuic|hysteria2|hy2)://[^\s\"'<>]+)")
@@ -86,15 +88,22 @@ def extract_uris(payload: bytes) -> list[str]:
     return found
 
 
+def all_subs_is_whitelist_feed(payload: bytes) -> bool:
+    """Fail closed if the upstream stops identifying itself as a whitelist feed."""
+    text = payload.decode("utf-8-sig", errors="replace")
+    first_uri = URI_RE.search(text)
+    header = text[:first_uri.start()] if first_uri else text[:8192]
+    header = header.lower()
+    return "profile-title" in header and any(marker in header for marker in
+                                               ("белых списк", "white list", "whitelist"))
+
+
 def checker_candidates(data: object, pool: str) -> list[Candidate]:
     if not isinstance(data, dict):
         return []
     found: list[Candidate] = []
     for group, contents in data.items():
-        is_whitelist = isinstance(group, str) and group.startswith("w_")
-        # The checker's "russia" group also comes from its whitelist feed.
-        if group == "russia":
-            continue
+        is_whitelist = isinstance(group, str) and (group.startswith("w_") or group == "russia")
         if is_whitelist != (pool == "whitelist"):
             continue
         # The checker's "other_countries" result is a map of country -> ranked results.
@@ -195,6 +204,23 @@ def has_country(candidate: Candidate) -> bool:
     text = f"{candidate.location_hint or ''} {unquote(urlsplit(candidate.uri).fragment)}".lower()
     return any(re.search(rf"(?<![a-zа-я]){re.escape(alias)}(?![a-zа-я])", text)
                for aliases, _ in COUNTRIES for alias in aliases)
+
+
+def country_key(candidate: Candidate) -> str | None:
+    fragment = unquote(urlsplit(candidate.uri).fragment)
+    text = f"{candidate.location_hint or ''} {fragment} {candidate.geo_location or ''}".lower()
+    for aliases, label in COUNTRIES:
+        if any(re.search(rf"(?<![a-zа-я]){re.escape(alias)}(?![a-zа-я])", text) for alias in aliases):
+            return label
+    for code, name in COUNTRY_RU.items():
+        if name.lower() in text:
+            return f"{code}:{name}"
+    flag = re.search(r"[\U0001F1E6-\U0001F1FF]{2}", text)
+    if flag:
+        for code, name in COUNTRY_RU.items():
+            if "".join(chr(ord(char) + 127397) for char in code) == flag.group():
+                return f"{code}:{name}"
+    return None
 
 
 def geolocate(candidate: Candidate) -> None:
@@ -314,16 +340,54 @@ def atomic_write(path: Path, content: bytes) -> None:
             os.unlink(temp_path)
 
 
-def write_pool(name: str, ranked: list[tuple[Candidate, float]], limit: int) -> list[str]:
-    selected = ranked[:limit]
-    unknown = [candidate for candidate, _ in selected
-               if not has_country(candidate)]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-        list(pool.map(geolocate, unknown))
-    resolved = sum(candidate.geo_location is not None for candidate in unknown)
-    print(f"Геолокация {name}: {resolved}/{len(unknown)} неразмеченных узлов", file=sys.stderr)
-    uris = [labeled_uri(candidate, name) for candidate, _ in selected]
-    return uris
+def select_diverse_pools(
+    normal_ranked: list[tuple[Candidate, float]],
+    whitelist_ranked: list[tuple[Candidate, float]],
+) -> tuple[list[tuple[Candidate, float]], list[tuple[Candidate, float]]]:
+    """Pick each country once first, then allow a second node when needed."""
+    ranked = sorted(
+        [("normal", candidate, latency) for candidate, latency in normal_ranked]
+        + [("whitelist", candidate, latency) for candidate, latency in whitelist_ranked],
+        key=lambda item: (item[2], item[1].uri),
+    )
+    limits = {"normal": NORMAL_LIMIT, "whitelist": WHITELIST_LIMIT}
+    selected: dict[str, list[tuple[Candidate, float]]] = {"normal": [], "whitelist": []}
+    country_counts: dict[str, int] = {}
+    selected_ids: set[int] = set()
+    geo_attempts = 0
+
+    for allowed_per_country in (1, MAX_SERVERS_PER_COUNTRY):
+        for pool_name, candidate, latency in ranked:
+            if len(selected[pool_name]) >= limits[pool_name] or id(candidate) in selected_ids:
+                continue
+            country = country_key(candidate)
+            if country is None and geo_attempts < MAX_GEOLOOKUPS_PER_RUN:
+                geo_attempts += 1
+                geolocate(candidate)
+                country = country_key(candidate)
+            country = country or "unknown-location"
+            if country_counts.get(country, 0) >= allowed_per_country:
+                continue
+            selected[pool_name].append((candidate, latency))
+            selected_ids.add(id(candidate))
+            country_counts[country] = country_counts.get(country, 0) + 1
+        if all(len(selected[name]) >= limits[name] for name in limits):
+            break
+
+    print(
+        f"Геолокация: {geo_attempts} запросов; выбрано разных стран "
+        f"{len(country_counts) - int('unknown-location' in country_counts)}",
+        file=sys.stderr,
+    )
+    print(
+        "Отбор по странам: " + ", ".join(f"{name} {len(items)}/{limits[name]}" for name, items in selected.items()),
+        file=sys.stderr,
+    )
+    return selected["normal"], selected["whitelist"]
+
+
+def write_pool(name: str, ranked: list[tuple[Candidate, float]]) -> list[str]:
+    return [labeled_uri(candidate, name) for candidate, _ in ranked]
 
 
 def main() -> int:
@@ -339,18 +403,27 @@ def main() -> int:
                 if source == "vless_checker":
                     candidates[pool].extend(checker_candidates(json.loads(payload), pool))
                 else:
+                    if source == "all_subs" and not all_subs_is_whitelist_feed(payload):
+                        raise ValueError("upstream header no longer identifies a whitelist feed")
                     candidates[pool].extend(Candidate(uri, source) for uri in extract_uris(payload))
             except (urllib.error.URLError, TimeoutError, ValueError, OSError, json.JSONDecodeError) as exc:
                 failures.append(f"{pool}/{source}: {exc}")
 
     normal_candidates = unique_endpoints(candidates["normal"])
     whitelist_candidates = unique_endpoints(candidates["whitelist"])
+    normal_endpoints = {candidate.endpoint for candidate in normal_candidates}
+    before_overlap_filter = len(whitelist_candidates)
+    whitelist_candidates = [candidate for candidate in whitelist_candidates if candidate.endpoint not in normal_endpoints]
+    print(f"Пересечение обычных и БС удалено: {before_overlap_filter - len(whitelist_candidates)}", file=sys.stderr)
     print(f"Кандидаты: обычные {len(normal_candidates)}, белые списки {len(whitelist_candidates)}", file=sys.stderr)
 
     normal_ranked = rank_live(normal_candidates)
     whitelist_ranked = rank_live(whitelist_candidates)
-    normal = write_pool("normal", normal_ranked, NORMAL_LIMIT)
-    whitelist = write_pool("whitelist", whitelist_ranked, WHITELIST_LIMIT)
+    normal_tcp_reachable = len(normal_ranked)
+    whitelist_tcp_reachable = len(whitelist_ranked)
+    normal_ranked, whitelist_ranked = select_diverse_pools(normal_ranked, whitelist_ranked)
+    normal = write_pool("normal", normal_ranked)
+    whitelist = write_pool("whitelist", whitelist_ranked)
     combined = normal + whitelist
     combined_body = [f"#profile-title: {PROFILE_TITLE}", "#profile-update-interval: 1", *combined]
     combined_bytes = ("\n".join(combined_body) + "\n").encode("utf-8")
@@ -359,8 +432,8 @@ def main() -> int:
     timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
     status = {
         "updated_at_utc": timestamp,
-        "normal": {"selected": len(normal), "target": NORMAL_LIMIT, "candidates": len(normal_candidates), "tcp_reachable": len(normal_ranked)},
-        "whitelist": {"selected": len(whitelist), "target": WHITELIST_LIMIT, "candidates": len(whitelist_candidates), "tcp_reachable": len(whitelist_ranked)},
+        "normal": {"selected": len(normal), "target": NORMAL_LIMIT, "candidates": len(normal_candidates), "tcp_reachable": normal_tcp_reachable},
+        "whitelist": {"selected": len(whitelist), "target": WHITELIST_LIMIT, "candidates": len(whitelist_candidates), "tcp_reachable": whitelist_tcp_reachable},
         "source_failures": failures,
         "probe": "TCP connect latency measured from GitHub Actions runner; not a full VPN handshake or a guarantee from the user's network.",
     }
