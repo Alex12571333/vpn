@@ -6,6 +6,7 @@ from __future__ import annotations
 import concurrent.futures
 import datetime as dt
 import html
+import ipaddress
 import json
 import math
 import os
@@ -203,19 +204,33 @@ def geolocate(candidate: Candidate) -> None:
         return
     host = endpoint[0]
     try:
-        ip = host if re.fullmatch(r"[0-9a-fA-F:.]+", host) else socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)[0][4][0]
-        url = f"https://ipwho.is/{quote(ip, safe=':.')}?fields=success,country,country_code"
-        request = urllib.request.Request(url, headers={"User-Agent": "velesVPN-free-subscription/1.0"})
-        with urllib.request.urlopen(request, timeout=4) as response:
-            data = json.loads(response.read(64 * 1024))
-        if not data.get("success"):
-            return
-        code = str(data.get("country_code", "")).upper()
-        country = COUNTRY_RU.get(code) or str(data.get("country", "")).strip()
-        flag = "".join(chr(ord(char) + 127397) for char in code) if re.fullmatch(r"[A-Z]{2}", code) else "🌐"
-        if country:
-            candidate.geo_location = f"{flag} {country}"
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError, IndexError, json.JSONDecodeError):
+        try:
+            ip = str(ipaddress.ip_address(host))
+        except ValueError:
+            ip = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)[0][4][0]
+        requests = (
+            (f"https://ipwho.is/{quote(ip, safe=':.')}?fields=success,country,country_code", "ipwho"),
+            (f"https://ipapi.co/{quote(ip, safe=':.')}/json/", "ipapi"),
+        )
+        for url, provider in requests:
+            try:
+                request = urllib.request.Request(url, headers={"User-Agent": "velesVPN-free-subscription/1.0"})
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    data = json.loads(response.read(64 * 1024))
+                if provider == "ipwho" and not data.get("success"):
+                    continue
+                if data.get("error"):
+                    continue
+                code = str(data.get("country_code", data.get("country", ""))).upper()
+                country_name = data.get("country") if provider == "ipwho" else data.get("country_name")
+                country = COUNTRY_RU.get(code) or str(country_name or "").strip()
+                flag = "".join(chr(ord(char) + 127397) for char in code) if re.fullmatch(r"[A-Z]{2}", code) else "🌐"
+                if country:
+                    candidate.geo_location = f"{flag} {country}"
+                    return
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
+                continue
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, IndexError):
         return
 
 
@@ -241,12 +256,7 @@ def node_label(candidate: Candidate, pool: str) -> str:
     if pool == "normal":
         suffix = "ОБЫЧНЫЙ"
     else:
-        cidr = candidate.source in {"igareck_white_cidr", "vless-checker"} or "cidr" in fragment.lower()
-        sni = "sni" in fragment.lower()
-        kind = "CIDR" if cidr else "SNI" if sni else "БС"
-        service_match = re.search(r"\b(vk|yandex|яндекс|youtube|ютуб|telegram|телеграм|discord|дискорд|google|гугл|cdnvideo|beeline|мтс|мегафон)\b", fragment, re.I)
-        service = service_match.group(0).upper() if service_match else None
-        suffix = f"БС · {kind}" + (f" · {service}" if service else "")
+        suffix = "БС"
     return f"{location} · {suffix}"
 
 
@@ -310,6 +320,8 @@ def write_pool(name: str, ranked: list[tuple[Candidate, float]], limit: int) -> 
                if not has_country(candidate)]
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
         list(pool.map(geolocate, unknown))
+    resolved = sum(candidate.geo_location is not None for candidate in unknown)
+    print(f"Геолокация {name}: {resolved}/{len(unknown)} неразмеченных узлов", file=sys.stderr)
     uris = [labeled_uri(candidate, name) for candidate, _ in selected]
     return uris
 
@@ -340,7 +352,7 @@ def main() -> int:
     normal = write_pool("normal", normal_ranked, NORMAL_LIMIT)
     whitelist = write_pool("whitelist", whitelist_ranked, WHITELIST_LIMIT)
     combined = normal + whitelist
-    combined_body = [f"#profile-title: {PROFILE_TITLE}", *combined]
+    combined_body = [f"#profile-title: {PROFILE_TITLE}", "#profile-update-interval: 1", *combined]
     combined_bytes = ("\n".join(combined_body) + "\n").encode("utf-8")
     atomic_write(OUT / "subscription.txt", combined_bytes)
 
